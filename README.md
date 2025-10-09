@@ -1,11 +1,11 @@
 # Flat-Field Correction for RTI (Sony ARW)
 
-Polynomial flat-fielding for Reflectance Transformation Imaging (RTI) and related photometric workflows. The scripts estimate a smooth illumination model from white-board captures (one per LED position) and apply the matched correction to each object image.
+Polynomial flat-fielding for Reflectance Transformation Imaging (RTI) and related photometric workflows. The scripts estimate a smooth illumination model from white‑board captures (one per LED position) and apply the matched correction to each object image.
 
-- Works in **linear** space (γ = 1) to preserve multiplicative ratios  
-- **Grayscale** or **per-channel** (RGB) fits  
-- Memory-safe polynomial evaluation (no giant design matrices)  
-- 8-bit **JPEG** for RTI Relight, **16-bit TIFF/PNG**, and flexible median exports (TIFF/PNG/JPG)
+- Works from **RAW (.ARW)** inputs (Sony); outputs TIFF/PNG/JPEG
+- **Grayscale** or **per‑channel** (RGB) polynomial fits (degree 3–9)
+- 8‑bit **JPEG** for RTI Relight; **TIFF/PNG** for analysis/archival
+- Optional median generation for diffuse/albedo textures
 
 ---
 
@@ -15,7 +15,7 @@ Polynomial flat-fielding for Reflectance Transformation Imaging (RTI) and relate
 pip install numpy opencv-python rawpy tifffile scikit-learn
 ```
 
-Python ≥3.8 recommended.
+Python ≥ 3.8 recommended.
 
 ---
 
@@ -28,10 +28,10 @@ project_root/
 ├─ flat_coeffs/               # Created on coefficient generation
 ├─ calculate_polynomial_coefficients.py
 ├─ flatfield_main.py
-└─ README.md
+└── README.md
 ```
 
-**Naming:** `image_001.ARW` ↔ `image_001_coeffs.pkl` (grayscale) or `image_001_coeffs_rgb.pkl` (per-channel).
+**Naming:** `image_001.ARW` ↔ `image_001_coeffs.pkl` (grayscale) or `image_001_coeffs_rgb.pkl` (per‑channel).
 
 ---
 
@@ -41,7 +41,7 @@ project_root/
 ```bash
 python calculate_polynomial_coefficients.py   --flat-dir RTI_flats   --output-dir flat_coeffs   --degree 5   --per-channel
 ```
-- Use `--per-channel` if RGB channels show different vignetting/LED patterns.  
+- Use `--per-channel` if RGB channels show different vignetting/LED patterns.
 - Degree: 3 (very smooth) · **5 (default)** · 7/9 (sharper LED hotspots).
 
 ### 2) Apply to RTI sets
@@ -53,34 +53,33 @@ python flatfield_main.py   --coeffs-path flat_coeffs   --parent-folder RTI_image
 python flatfield_main.py   --coeffs-path flat_coeffs   --parent-folder RTI_images   --per-channel --tiff --bit-depth 16
 ```
 
-**Notes on outputs**
-- `--jpg --bit-depth 8` → JPEG (quality 100).  
-- `--jpg --bit-depth 16` → saved as **16-bit PNG** (JPEG is 8-bit only).  
-- `--tiff` supports 8-bit or 16-bit.  
-- `--median` honours `--median-format {tiff,png,jpg}` and `--median-bit-depth` (defaults to `--bit-depth`). JPEG medians are always 8-bit with a warning if 16-bit is requested.
-
-Use the median flags to tailor outputs for downstream relighting, segmentation, or archival workflows.
-
 ### Optional: diffuse/albedo median
 ```bash
-python flatfield_main.py   --coeffs-path flat_coeffs   --parent-folder RTI_images   --median \
-    --median-format png --median-bit-depth 16 --median-range "01-08"
+python flatfield_main.py   --coeffs-path flat_coeffs   --parent-folder RTI_images   --median --median-range "01-08"
 ```
-Pick 4–8 near-perpendicular lights to suppress highlights and shadows, adjusting format/bit depth to suit downstream tools.
+Pick 4–8 near‑perpendicular lights to suppress highlights and shadows.
 
 ---
 
-## Colour-correction policy (concise)
+## Output behaviour
 
-Flat-fielding is a **multiplicative** correction and must be done on **linear** data.
+- `--jpg --bit-depth 8` → **8‑bit JPEG** (quality 100).
+- `--jpg --bit-depth 16` → **JPEG is 8‑bit only** (OpenCV will down‑cast). For true 16‑bit, use `--tiff --bit-depth 16` (or PNG via `--png` if available in your branch).
+- `--tiff` supports 8‑bit or 16‑bit.
+- `--median` saves a TIFF at the **selected bit‑depth** for the run.
 
-- The scripts load RAW with `gamma=(1,1)`, `no_auto_bright=True`, apply camera WB (multiplicative), and then divide by the fitted flat.
-- **Linear adjustments** (safe before *or* after flat-field): per-channel gains, exposure scalars, 3×3 colour matrices.
-- **Non-linear adjustments** (do **after** flat-field): tone curves, gamma ≠ 1, LUTs, filmic/DRC, local contrast.
+---
 
-**Using RawTherapee before flat-field:** allowed **only** if you export **linear** 16-bit TIFF and apply *strictly linear* calibration (WB, exposure scalar, chart-derived matrix/gains), with identical settings for every frame. Otherwise, flat-field first, then colour-grade.
+## Colour‑correction policy (tool‑agnostic)
 
-For RTI/photometric-stereo stacks, avoid any frame-wise auto adjustments; keep settings uniform across the stack.
+Flat‑fielding is a **multiplicative** operation and should be performed on data with a **linear** tone response.
+
+- **RAW development in this tool.** The code develops RAW with camera white balance and **no auto‑brightening**. If you require strict linearity, set `gamma=(1,1)` in the RAW post‑processing call within the scripts.
+- **Linear adjustments** (safe before *or* after flat‑field): per‑channel gains, a global exposure scalar, and a 3×3 colour matrix (these commute with division).
+- **Non‑linear adjustments** (do **after** flat‑field): tone curves, gamma encoding (γ ≠ 1), LUTs, “filmic/DRC”, local contrast/sharpening, highlight reconstruction with tone mapping, and creative looks.
+- **Uniform settings for stacks.** For RTI/photometric‑stereo stacks, avoid any frame‑wise auto adjustments; keep settings **identical across all images**.
+
+**Important:** This project **only ingests RAW (.ARW)**. If you prefer external calibration in third‑party software, run **flat‑fielding here first on the RAWs**, then apply calibration/colour work to the **flat‑fielded outputs** in that editor.
 
 ---
 
@@ -88,29 +87,28 @@ For RTI/photometric-stereo stacks, avoid any frame-wise auto adjustments; keep s
 
 - **Mode mismatch**: If coefficients were made with `--per-channel`, you must also run application with `--per-channel` (and vice versa).
 - **No coefficients found**: check that flat and image numbering match (`image_001`, `image_002`, …).
-- **Shape warnings**: coefficients were derived at a different resolution/crop. Re-capture/recompute for best results.
-- **Performance**: set `--num-cores` sensibly; RAW decode and TIFF write are I/O-heavy.
+- **Shape warnings**: coefficients were derived at a different resolution/crop. Re‑capture/recompute for best results.
+- **Performance**: set `--num-cores` sensibly; RAW decode and TIFF writing are I/O‑heavy.
 
 ---
 
-## Rationale (very brief)
+## Rationale (brief)
 
 - Polynomial surfaces (degree 3–9) approximate combined lens vignetting and LED angular falloff without overfitting.
-- Evaluation uses precomputed exponent maps to avoid building an `(H·W)×M` design matrix (large images remain memory-safe).
-- Working in linear space ensures that division by the flat preserves true intensity ratios.
+- Working (or developing) in a linear tone space ensures division by the flat preserves intensity ratios needed for RTI/PS analysis.
 
 ---
 
 ## Licence
 
-**GNU General Public License v3.0 (GPL-3.0).**  
+**GNU General Public License v3.0 (GPL‑3.0).**  
 See `LICENSE` for full terms.
 
 ---
 
 ## Citation / acknowledgements
 
-If you use this in publications, please cite the repository and acknowledge the use of polynomial flat-fielding for cultural-heritage RTI/photometric workflows.
+If you use this in publications, please cite the repository and acknowledge the use of polynomial flat‑fielding for cultural‑heritage RTI/photometric workflows.
 
 ---
 
@@ -127,6 +125,5 @@ python flatfield_main.py --coeffs-path flat_coeffs --parent-folder RTI_images --
 python flatfield_main.py --coeffs-path flat_coeffs --parent-folder RTI_images --per-channel --tiff --bit-depth 16
 
 # Diffuse/albedo median (images 1–8)
-python flatfield_main.py --coeffs-path flat_coeffs --parent-folder RTI_images \
-    --median --median-format png --median-bit-depth 16 --median-range "01-08"
+python flatfield_main.py --coeffs-path flat_coeffs --parent-folder RTI_images --median --median-range "01-08"
 ```
