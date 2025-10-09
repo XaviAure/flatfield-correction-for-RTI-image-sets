@@ -67,8 +67,8 @@ def setup_directories(args, folder_name):
     
     # Set up output directories
     output_dir_tiff = os.path.join(parent_folder, f"{folder_name}_flatfield_tiffs{bit_suffix}")
-    jpg_dir_label = "jpgs" if args.bit_depth == 8 else "pngs"
-    output_dir_jpg = os.path.join(parent_folder, f"{folder_name}_flatfield_{jpg_dir_label}{bit_suffix}")
+    # JPG output is always 8-bit
+    output_dir_jpg = os.path.join(parent_folder, f"{folder_name}_flatfield_jpgs_8bit")
     
     median_bit_suffix = f"_{args.median_bit_depth}bit"
     median_dir_label = {
@@ -84,7 +84,15 @@ def setup_directories(args, folder_name):
 
     # Median directory is shared across all folders
     median_output_dir = os.path.join(parent_folder, f"median_images_{median_dir_label}{median_bit_suffix}")
-    output_median_file = f"{folder_name}{median_extension}"
+    
+    # Extract and zero-pad folder number for consistent median naming
+    folder_num = extract_image_number(folder_name)
+    if folder_num:
+        # Zero-pad to 2 digits (e.g., RTI_1 → RTI_01)
+        median_base = re.sub(r'\d+', folder_num.zfill(2), folder_name)
+    else:
+        median_base = folder_name
+    output_median_file = f"{median_base}{median_extension}"
     
     # Create dictionary of paths
     paths = {
@@ -93,7 +101,8 @@ def setup_directories(args, folder_name):
         'output_dir_tiff': output_dir_tiff,
         'output_dir_jpg': output_dir_jpg,
         'median_output_dir': median_output_dir,
-        'output_median_file': output_median_file
+        'output_median_file': output_median_file,
+        'num_cores': args.num_cores
     }
     
     # Only create directories for the outputs that will be generated
@@ -110,7 +119,7 @@ def setup_directories(args, folder_name):
 # Fixed Parameters
 # ---------------------------
 # Optional cropping to match other processing workflows (e.g., RawTherapee exports)
-# Set to camera native resolution (e.g., 9504×6336 for Sony A7R IV) to disable cropping
+# Set to camera native resolution (e.g., 9504×6336 for Sony A7RV) to disable cropping
 target_width = 7956
 target_height = 5312
 shift_x = 0
@@ -195,8 +204,24 @@ def flat_field_correction(image, fitted_flat):
     Returns:
         Corrected image with uniform illumination
     """
-    normalized_flat = fitted_flat / np.mean(fitted_flat)
-    corr_image = cv2.divide(image.astype(np.float32), normalized_flat + 1e-5)
+    flat_mean = np.mean(fitted_flat)
+    normalized_flat = fitted_flat / flat_mean
+    # Epsilon protects against division by zero in dark regions of the flat
+    # Since normalized_flat has mean=1, use a tiny value (0.0001 = 0.01% of normalized range)
+    epsilon = 0.0001
+    
+    corr_image = cv2.divide(image.astype(np.float32), normalized_flat + epsilon)
+    
+    # Check for clipping and warn if significant
+    max_val = np.max(corr_image)
+    if max_val > 65535:
+        clipped_pixels = np.sum(corr_image > 65535)
+        total_pixels = corr_image.size
+        clip_pct = (clipped_pixels / total_pixels) * 100
+        # Only warn if more than 0.01% of pixels clip (avoids noise from isolated hot pixels)
+        if clip_pct > 0.01:
+            print(f"  WARNING: {clip_pct:.2f}% of pixels exceed 16-bit range (max={max_val:.0f}), clipping to 65535")
+    
     corr_image = np.clip(corr_image, 0, 65535).astype(image.dtype)
     return corr_image
 
@@ -338,7 +363,7 @@ def process_all_images(img_files, paths, median_range=None, per_channel=False):
     
     # Keep original files for processing
     files_to_process = sorted(img_files)
-    
+
     # Filter files by range if specified for median only
     median_files = files_to_process
     if median_range:
@@ -365,8 +390,8 @@ def process_all_images(img_files, paths, median_range=None, per_channel=False):
     print(f"Processing {len(files_to_process)} images with flatfield correction...")
     print(f"Correction mode: {'Per-channel (R, G, B separate)' if per_channel else 'Grayscale (single correction)'}")
     
-    # Get num_cores from global scope (set in main)
-    global num_cores
+    # Get num_cores from paths
+    num_cores = paths.get('num_cores', 10)
     
     # Process each raw file with flatfield correction
     with ProcessPoolExecutor(max_workers=num_cores) as executor:
@@ -396,16 +421,11 @@ def save_processed_images(processed_images, paths, generate_tiff=True, generate_
             save_tiff_image(image, tiff_output_path, bit_depth)
             print(f"TIFF file saved: {tiff_output_path}")
             
-        # Save as JPG if requested
+        # Save as JPG if requested (always 8-bit)
         if generate_jpg:
-            if bit_depth == 8:
-                base_output_path = os.path.join(paths['output_dir_jpg'], os.path.basename(img_file)[:-4] + '.jpg')
-                saved_path = save_jpeg_image(image, base_output_path)
-                print(f"JPG file saved: {saved_path}")
-            else:
-                base_output_path = os.path.join(paths['output_dir_jpg'], os.path.basename(img_file)[:-4] + '.png')
-                saved_path = save_png_image(image, base_output_path, bit_depth=bit_depth)
-                print(f"PNG file saved: {saved_path}")
+            base_output_path = os.path.join(paths['output_dir_jpg'], os.path.basename(img_file)[:-4] + '.jpg')
+            saved_path = save_jpeg_image(image, base_output_path)
+            print(f"JPG file saved: {saved_path}")
 
 def compute_and_save_median(filtered_processed_images, paths, median_format='tiff', bit_depth=16):
     """
@@ -439,21 +459,25 @@ def compute_and_save_median(filtered_processed_images, paths, median_format='tif
 
 def process_single_raw_image(img_file, paths, per_channel=False):
     """Process a single raw image and return the corrected image"""
-    # Determine coefficient filename based on mode
-    base_name = os.path.basename(img_file)[:-4]
-    if per_channel:
-        coeffs_path = os.path.join(paths['coeffs_dir'], base_name + '_coeffs_rgb.pkl')
-        # Fallback to grayscale if per-channel not found
-        if not os.path.exists(coeffs_path):
-            coeffs_path = os.path.join(paths['coeffs_dir'], base_name + '_coeffs.pkl')
-    else:
-        coeffs_path = os.path.join(paths['coeffs_dir'], base_name + '_coeffs.pkl')
-        # Fallback to per-channel if grayscale not found
-        if not os.path.exists(coeffs_path):
-            coeffs_path = os.path.join(paths['coeffs_dir'], base_name + '_coeffs_rgb.pkl')
-    
-    # Check if the coefficients file exists for the current image
-    if os.path.exists(coeffs_path):
+    # Determine coefficient filename based on numeric token match
+    base_name = os.path.splitext(os.path.basename(img_file))[0]
+    image_num = extract_image_number(base_name)
+
+    coeffs_path = None
+    if image_num:
+        pattern_rgb = re.compile(rf".*{re.escape(image_num)}.*_coeffs_rgb\.pkl$", re.IGNORECASE)
+        pattern_gray = re.compile(rf".*{re.escape(image_num)}.*_coeffs\.pkl$", re.IGNORECASE)
+
+        for entry in sorted(os.listdir(paths['coeffs_dir'])):
+            candidate_path = os.path.join(paths['coeffs_dir'], entry)
+            if pattern_rgb.match(entry):
+                coeffs_path = candidate_path
+                per_channel = True
+                break
+            if coeffs_path is None and pattern_gray.match(entry):
+                coeffs_path = candidate_path
+
+    if coeffs_path and os.path.exists(coeffs_path):
         print(f"Processing {img_file} with {coeffs_path}")
         
         # Load the image using rawpy
@@ -488,7 +512,6 @@ def process_single_raw_image(img_file, paths, per_channel=False):
             
             return cropped_image
     else:
-        # Log if the coefficients file does not exist for an image
         print(f"No coefficients found for {img_file}, skipping.")
         return None
 
@@ -502,8 +525,7 @@ def print_config(args, paths):
     if args.all or args.tiff:
         print(f"Output TIFF directory: {paths['output_dir_tiff']}")
     if args.all or args.jpg:
-        label = "JPG" if args.bit_depth == 8 else "PNG (requested via --jpg)"
-        print(f"Output {label} directory: {paths['output_dir_jpg']}")
+        print(f"Output JPG directory: {paths['output_dir_jpg']}")
     
     print(f"Target width x height: {target_width} x {target_height}")
     print(f"Shift (X, Y): ({shift_x}, {shift_y})")
@@ -517,7 +539,7 @@ def print_config(args, paths):
             print(f"Median image range: {args.median_range}")
     
     print(f"Bit depth: {args.bit_depth}-bit")
-    print(f"Number of cores: {num_cores}")
+    print(f"Number of cores: {args.num_cores}")
     print(f"Selected outputs: " + 
           ("All" if args.all else ", ".join(
               filter(None, [
@@ -530,9 +552,6 @@ def print_config(args, paths):
 # Main execution
 if __name__ == "__main__":
     args = parse_arguments()
-    
-    # Set global num_cores from arguments
-    num_cores = args.num_cores
     
     # Determine what to generate
     generate_tiff = args.all or args.tiff
@@ -554,10 +573,8 @@ if __name__ == "__main__":
     for folder_name in sorted(os.listdir(parent_folder)):
         folder_path = os.path.join(parent_folder, folder_name)
         if os.path.isdir(folder_path):
-            # Check if the folder contains raw images
-            if os.path.exists(folder_path):
-                raw_files = sorted(f for f in os.listdir(folder_path) if f.endswith(RAW_EXTENSIONS))
-                if raw_files:
+            raw_files = sorted(f for f in os.listdir(folder_path) if f.endswith(RAW_EXTENSIONS))
+            if raw_files:
                     image_folders.append(folder_name)
     
     if not image_folders:
