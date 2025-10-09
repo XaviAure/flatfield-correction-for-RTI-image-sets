@@ -1,0 +1,5 @@
+numpy>=1.23,<2.0
+opencv-python>=4.5.0
+rawpy>=0.18
+tifffile>=2021.0.0
+scikit-learn>=1.1,<1.5
