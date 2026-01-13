@@ -59,6 +59,7 @@ python flatfield_main.py   --coeffs-path flat_coeffs   --parent-folder RTI_image
 - `--tiff` supports 8-bit or 16-bit (controlled by `--bit-depth`).
 - `--median` honours `--median-format {tiff,png,jpg}` and `--median-bit-depth` (defaults to `--bit-depth`). JPEG medians are always 8-bit with a warning if 16-bit is requested.
 - `--num-cores N` sets parallel processing threads (default: 10).
+- `--linear-tiff` use this if you need linear TIFFs for further processing pipelines. Without this flag, TIFFs are sRGB-encoded for direct viewing.
 
 Use the median flags to tailor outputs for downstream relighting, segmentation, or archival workflows.
 
