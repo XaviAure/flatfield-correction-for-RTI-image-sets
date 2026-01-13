@@ -6,7 +6,7 @@ Corrects for combined lens vignetting + LED illumination patterns by applying
 position-specific corrections derived from white board reference captures.
 
 Author: Xavier Aure Calvet
-Version: 1.1.0
+Version: 1.2.0
 License: GPL-3.0
 """
 
@@ -21,7 +21,7 @@ import re
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -43,6 +43,8 @@ def parse_arguments():
                        help='Use per-channel RGB correction (must match coefficient generation mode)')
     parser.add_argument('--coeffs-path', type=str, required=True, help='Path to the folder containing coefficient files')
     parser.add_argument('--parent-folder', type=str, required=True, help='Path to the parent folder containing all image set folders (RTI_01, RTI_02, etc.)')
+    parser.add_argument('--linear-tiff', action='store_true',
+                       help='Save TIFFs in linear gamma (for further processing). Default is sRGB-encoded for viewing.')
     args = parser.parse_args()
     
     # If no specific output is selected, default to all
@@ -139,6 +141,67 @@ COORDINATE_NORMALIZATION_DEFAULT = '[-1, 1]'
 COORDINATE_NORMALIZATION_PIXEL = 'pixel'
 
 
+# ---------------------------
+# Gamma / Color Space Functions
+# ---------------------------
+def linear_to_srgb(linear):
+    """
+    Convert linear RGB values to sRGB using the official IEC 61966-2-1 transfer function.
+    
+    Args:
+        linear: numpy array with values in [0, 1] range (linear light)
+    
+    Returns:
+        sRGB-encoded array in [0, 1] range
+    """
+    # Official sRGB transfer function (IEC 61966-2-1)
+    return np.where(
+        linear <= 0.0031308,
+        12.92 * linear,
+        1.055 * np.power(np.clip(linear, 0.0031308, None), 1.0/2.4) - 0.055
+    )
+
+
+def apply_srgb_gamma_16bit(image_16bit):
+    """
+    Apply sRGB gamma encoding to a 16-bit linear image.
+    
+    Args:
+        image_16bit: uint16 numpy array (0-65535, linear)
+    
+    Returns:
+        uint16 numpy array (0-65535, sRGB-encoded)
+    """
+    # Normalize to [0, 1]
+    linear = image_16bit.astype(np.float32) / 65535.0
+    
+    # Apply sRGB transfer function
+    srgb = linear_to_srgb(linear)
+    
+    # Scale back to 16-bit
+    return np.clip(srgb * 65535.0, 0, 65535).astype(np.uint16)
+
+
+def apply_srgb_gamma_8bit(image_16bit):
+    """
+    Apply sRGB gamma encoding and convert 16-bit linear to 8-bit sRGB.
+    
+    Args:
+        image_16bit: uint16 numpy array (0-65535, linear)
+    
+    Returns:
+        uint8 numpy array (0-255, sRGB-encoded)
+    """
+    # Normalize to [0, 1]
+    linear = image_16bit.astype(np.float32) / 65535.0
+    
+    # Apply sRGB transfer function
+    srgb = linear_to_srgb(linear)
+    
+    # Scale to 8-bit
+    return np.clip(srgb * 255.0, 0, 255).astype(np.uint8)
+
+
 def _generate_2d_powers(degree: int) -> np.ndarray:
     """Replicate scikit-learn's PolynomialFeatures power ordering for 2D inputs."""
     powers = []
@@ -226,37 +289,93 @@ def flat_field_correction(image, fitted_flat):
     return corr_image
 
 def save_jpeg_image(image, output_path):
-    """Save image as standard 8-bit JPEG."""
-    scaled_image = cv2.convertScaleAbs(image, alpha=(255.0 / 65535.0))
+    """
+    Save image as standard 8-bit sRGB JPEG.
+    
+    Applies proper sRGB gamma encoding to convert from linear light values
+    to the sRGB color space expected by JPEG viewers.
+    
+    Args:
+        image: uint16 numpy array (0-65535, linear light)
+        output_path: Output file path
+    
+    Returns:
+        Final output path used
+    """
+    # Apply sRGB gamma encoding and convert to 8-bit
+    srgb_8bit = apply_srgb_gamma_8bit(image)
+    
     if not output_path.lower().endswith('.jpg'):
         output_path = os.path.splitext(output_path)[0] + '.jpg'
-    cv2.imwrite(output_path, cv2.cvtColor(scaled_image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
+    
+    cv2.imwrite(output_path, cv2.cvtColor(srgb_8bit, cv2.COLOR_RGB2BGR), 
+                [cv2.IMWRITE_JPEG_QUALITY, 100])
     return output_path
 
 
-def save_png_image(image, output_path, bit_depth=16):
-    """Save image as PNG at the requested bit depth (8 or 16)."""
+def save_png_image(image, output_path, bit_depth=16, linear=False):
+    """
+    Save image as PNG at the requested bit depth (8 or 16).
+    
+    Args:
+        image: uint16 numpy array (0-65535, linear light)
+        output_path: Output file path
+        bit_depth: 8 or 16
+        linear: If True, save linear values; if False, apply sRGB gamma
+    
+    Returns:
+        Final output path used
+    """
     if not output_path.lower().endswith('.png'):
         output_path = os.path.splitext(output_path)[0] + '.png'
 
     if bit_depth == 8:
-        scaled_image = cv2.convertScaleAbs(image, alpha=(255.0 / 65535.0))
+        if linear:
+            # Linear 8-bit (unusual, but supported)
+            scaled_image = cv2.convertScaleAbs(image, alpha=(255.0 / 65535.0))
+        else:
+            # sRGB-encoded 8-bit (standard)
+            scaled_image = apply_srgb_gamma_8bit(image)
         png_ready = cv2.cvtColor(scaled_image, cv2.COLOR_RGB2BGR)
     else:
-        png_ready = cv2.cvtColor(image.astype(np.uint16), cv2.COLOR_RGB2BGR)
+        if linear:
+            # Linear 16-bit
+            png_ready = cv2.cvtColor(image.astype(np.uint16), cv2.COLOR_RGB2BGR)
+        else:
+            # sRGB-encoded 16-bit
+            srgb_16bit = apply_srgb_gamma_16bit(image)
+            png_ready = cv2.cvtColor(srgb_16bit, cv2.COLOR_RGB2BGR)
 
     cv2.imwrite(output_path, png_ready, [cv2.IMWRITE_PNG_COMPRESSION, 3])
     return output_path
 
-def save_tiff_image(image, output_path, bit_depth=16):
-    """Save image as TIFF with specified bit depth"""
+def save_tiff_image(image, output_path, bit_depth=16, linear=False):
+    """
+    Save image as TIFF with specified bit depth.
+    
+    Args:
+        image: uint16 numpy array (0-65535, linear light)
+        output_path: Output file path
+        bit_depth: 8 or 16
+        linear: If True, save linear values (for processing pipelines);
+                if False, apply sRGB gamma (for viewing)
+    """
     if bit_depth == 8:
-        # Convert to 8-bit
-        scaled_image = cv2.convertScaleAbs(image, alpha=(255.0/65535.0))
+        if linear:
+            # Linear 8-bit (unusual, but supported)
+            scaled_image = cv2.convertScaleAbs(image, alpha=(255.0/65535.0))
+        else:
+            # sRGB-encoded 8-bit
+            scaled_image = apply_srgb_gamma_8bit(image)
         tifffile.imwrite(output_path, scaled_image)
     else:
-        # Save as 16-bit
-        tifffile.imwrite(output_path, image)
+        if linear:
+            # Linear 16-bit (for further processing)
+            tifffile.imwrite(output_path, image)
+        else:
+            # sRGB-encoded 16-bit (for viewing)
+            srgb_16bit = apply_srgb_gamma_16bit(image)
+            tifffile.imwrite(output_path, srgb_16bit)
 
 def load_polynomial_and_apply(image, coeffs_path, per_channel=False):
     """Load polynomial coefficients and apply flatfield correction without huge matrices."""
@@ -409,7 +528,7 @@ def process_all_images(img_files, paths, median_range=None, per_channel=False):
     print(f"Successfully processed {len(processed_images)} images")
     return processed_images, median_files
 
-def save_processed_images(processed_images, paths, generate_tiff=True, generate_jpg=True, bit_depth=16):
+def save_processed_images(processed_images, paths, generate_tiff=True, generate_jpg=True, bit_depth=16, linear_tiff=False):
     """Save processed images as TIFF and/or JPG based on options"""
     if not (generate_tiff or generate_jpg):
         return
@@ -418,16 +537,16 @@ def save_processed_images(processed_images, paths, generate_tiff=True, generate_
         # Save as TIFF if requested
         if generate_tiff:
             tiff_output_path = os.path.join(paths['output_dir_tiff'], os.path.basename(img_file)[:-4] + '.tif')
-            save_tiff_image(image, tiff_output_path, bit_depth)
+            save_tiff_image(image, tiff_output_path, bit_depth, linear=linear_tiff)
             print(f"TIFF file saved: {tiff_output_path}")
             
-        # Save as JPG if requested (always 8-bit)
+        # Save as JPG if requested (always 8-bit sRGB)
         if generate_jpg:
             base_output_path = os.path.join(paths['output_dir_jpg'], os.path.basename(img_file)[:-4] + '.jpg')
             saved_path = save_jpeg_image(image, base_output_path)
             print(f"JPG file saved: {saved_path}")
 
-def compute_and_save_median(filtered_processed_images, paths, median_format='tiff', bit_depth=16):
+def compute_and_save_median(filtered_processed_images, paths, median_format='tiff', bit_depth=16, linear=False):
     """
     Compute and save median image from the filtered subset of processed images
     """
@@ -447,10 +566,10 @@ def compute_and_save_median(filtered_processed_images, paths, median_format='tif
     median_output_path = os.path.join(paths['median_output_dir'], paths['output_median_file'])
 
     if median_format == 'tiff':
-        save_tiff_image(median_image, median_output_path, bit_depth)
+        save_tiff_image(median_image, median_output_path, bit_depth, linear=linear)
         saved_path = median_output_path
     elif median_format == 'png':
-        saved_path = save_png_image(median_image, median_output_path, bit_depth=bit_depth)
+        saved_path = save_png_image(median_image, median_output_path, bit_depth=bit_depth, linear=linear)
     else:
         saved_path = save_jpeg_image(median_image, median_output_path)
 
@@ -483,12 +602,14 @@ def process_single_raw_image(img_file, paths, per_channel=False):
         # Load the image using rawpy
         with rawpy.imread(os.path.join(paths['img_dir'], img_file)) as raw:
             # Postprocess to convert the raw image to a visible spectrum image
+            # NOTE: gamma=(1, 1) outputs LINEAR light values - this is correct for
+            # flatfield correction math. Gamma encoding is applied at save time.
             post_kwargs = dict(
                 use_camera_wb=True,
                 half_size=False,
                 no_auto_bright=True,
                 output_bps=16,
-                gamma=(1, 1)
+                gamma=(1, 1)  # Linear output for correct flatfield math
             )
             if LINEAR_OUTPUT_COLORSPACE is not None:
                 post_kwargs['output_color'] = LINEAR_OUTPUT_COLORSPACE
@@ -505,6 +626,7 @@ def process_single_raw_image(img_file, paths, per_channel=False):
                 corrected_image = image_float
             
             # After correction, clip the image values to ensure they are within valid range
+            # Image remains in LINEAR space - gamma encoding happens at save time
             corrected_image = np.clip(corrected_image, 0, 65535).astype(np.uint16)
             
             # Crop the corrected image based on the specified parameters
@@ -524,6 +646,7 @@ def print_config(args, paths):
     
     if args.all or args.tiff:
         print(f"Output TIFF directory: {paths['output_dir_tiff']}")
+        print(f"TIFF gamma: {'Linear (for processing)' if args.linear_tiff else 'sRGB (for viewing)'}")
     if args.all or args.jpg:
         print(f"Output JPG directory: {paths['output_dir_jpg']}")
     
@@ -612,14 +735,15 @@ if __name__ == "__main__":
         
         # Generate requested outputs from processed images
         if generate_tiff or generate_jpg:
-            save_processed_images(processed_images, paths, generate_tiff, generate_jpg, args.bit_depth)
+            save_processed_images(processed_images, paths, generate_tiff, generate_jpg, args.bit_depth, args.linear_tiff)
         
         if generate_median:
             compute_and_save_median(
                 {file: processed_images[file] for file in median_files if file in processed_images},
                 paths,
                 args.median_format,
-                args.median_bit_depth
+                args.median_bit_depth,
+                linear=args.linear_tiff
             )
             
     print("\n" + "=" * 80)
